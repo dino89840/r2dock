@@ -162,11 +162,12 @@ async function runUpload(job, { url, key, faststart }) {
       const uploader = new Upload({
         client: s3,
         params: {
-          Bucket: R2_BUCKET,
-          Key: objectKey,
-          Body: uploadStream,
-          ContentType: contentType,
-        },
+  Bucket: R2_BUCKET,
+  Key: objectKey,
+  Body: uploadStream,
+  ContentType: contentType,
+  ContentDisposition: `attachment; filename="${objectKey}"`,
+},
         queueSize: 4,
         partSize: 8 * 1024 * 1024,
       });
@@ -203,11 +204,12 @@ async function runUpload(job, { url, key, faststart }) {
       const uploader = new Upload({
         client: s3,
         params: {
-          Bucket: R2_BUCKET,
-          Key: objectKey,
-          Body: resp.body,
-          ContentType: contentType,
-        },
+  Bucket: R2_BUCKET,
+  Key: objectKey,
+  Body: resp.body,
+  ContentType: contentType,
+  ContentDisposition: `attachment; filename="${objectKey}"`,
+},
         queueSize: 4,
         partSize: 8 * 1024 * 1024,
       });
