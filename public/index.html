@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="my">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="theme-color" content="#f38020" />
+<title>R2 Uploader</title>
+<style>
+  :root { color-scheme: light dark; --brand:#f38020; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 560px; margin: 0 auto;
+    padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+    line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 8px 0 4px; }
+  p.sub { margin: 0 0 16px; opacity: .75; font-size: 14px; }
+  label { display:block; margin-top: 14px; font-weight: 600; font-size: 14px; }
+  input[type=url], input[type=text] {
+    width:100%; padding:12px 14px; border:1px solid #8886; border-radius:10px;
+    font-size:16px; background: transparent; color: inherit;
+  }
+  input:focus { outline:2px solid var(--brand); border-color: transparent; }
+  .check {
+    margin-top: 14px; display:flex; gap:10px; align-items:flex-start;
+    padding: 12px; border-radius: 10px; background:#8881; border:1px solid #8883;
+  }
+  .check input { width: 20px; height: 20px; margin-top:2px; }
+  .check label { margin:0; font-weight:600; font-size:14px; }
+  .check small { display:block; opacity:.7; font-weight:400; margin-top:2px; }
+  button {
+    margin-top: 18px; width: 100%; padding: 14px;
+    font-size: 16px; font-weight: 600;
+    border: 0; border-radius: 12px; background: var(--brand); color:#fff;
+    cursor: pointer;
+  }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  button.secondary { background:#555; margin-top: 8px; }
+  .card {
+    margin-top: 18px; padding: 14px; border-radius: 12px;
+    background: #8881; border: 1px solid #8883;
+  }
+  .row { display:flex; gap:8px; align-items:center; }
+  .url {
+    flex: 1; word-break: break-all; font-family: ui-monospace, Menlo, monospace;
+    font-size: 13px; padding: 8px; background:#0002; border-radius: 8px;
+  }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background:#222; color:#fff; padding: 10px 16px; border-radius: 999px;
+    font-size: 14px; opacity: 0; transition: opacity .25s, transform .25s;
+    pointer-events:none; z-index: 99;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+  pre {
+    background:#0002; padding:12px; border-radius:10px; white-space:pre-wrap;
+    word-break:break-all; margin-top:12px; font-size:12px;
+  }
+  small { opacity:.7; }
+  .ok { color:#1aa260; }
+  .err { color:#d33; }
+  .progress-wrap {
+    margin-top: 10px; height: 10px; border-radius: 999px;
+    background: #8883; overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%; width: 0%; background: var(--brand);
+    transition: width .25s ease;
+  }
+  .meta { display:flex; justify-content:space-between; font-size: 12px; opacity:.8; margin-top:6px; }
+</style>
+</head>
+<body>
+  <h1>☁️ R2 Remote Uploader</h1>
+  <p class="sub">Remote URL ထည့်ပြီး R2 bucket ထဲ တင်ပါ။ ပြီးရင် public link ကို auto-copy လုပ်ပေးမယ်။</p>
+
+  <label for="url">Remote File URL *</label>
+  <input id="url" type="url" inputmode="url" autocomplete="off"
+         placeholder="https://example.com/video.mp4" />
+
+  <label for="key">Object Key (optional)</label>
+  <input id="key" type="text" autocomplete="off"
+         placeholder="folder/myfile.mp4" />
+
+  <div class="check">
+    <input id="faststart" type="checkbox" />
+    <label for="faststart">
+      🚀 MP4 Fast Start ထည့်မယ်
+      <small>video play မြန်စေဖို့ moov atom ကို ဖိုင်ရှေ့ပို့ပေးမယ် (mp4/mov သာ၊ server မှာ ffmpeg လိုတယ်၊ နည်းနည်းကြာတယ်)</small>
+    </label>
+  </div>
+
+  <button id="go">⬆️ Upload to R2</button>
+
+  <div id="result" class="card" hidden>
+    <div id="status"></div>
+    <div id="progressWrap" hidden>
+      <div class="progress-wrap"><div id="bar" class="progress-bar"></div></div>
+      <div class="meta">
+        <span id="phase">—</span>
+        <span id="pctText">0%</span>
+      </div>
+    </div>
+
+    <div id="linkBox" hidden>
+      <div style="margin:10px 0 6px; font-weight:600; font-size:14px;">Public URL</div>
+      <div class="row">
+        <div id="publicUrl" class="url"></div>
+      </div>
+      <div class="row" style="margin-top:8px; gap:8px;">
+        <button id="copyBtn" class="secondary" style="margin:0;">📋 Copy</button>
+        <button id="openBtn" class="secondary" style="margin:0;">↗ Open</button>
+        <button id="shareBtn" class="secondary" style="margin:0; display:none;">📤 Share</button>
+      </div>
+    </div>
+    <details style="margin-top:12px;">
+      <summary><small>Raw response</small></summary>
+      <pre id="raw"></pre>
+    </details>
+  </div>
+
+  <div id="toast" class="toast">Copied ✓</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const toast = (msg) => {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove('show'), 1600);
+};
+
+function fmtBytes(n) {
+  if (!n || isNaN(n)) return '—';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0; while (n >= 1024 && i < u.length-1) { n/=1024; i++; }
+  return n.toFixed(n < 10 ? 2 : 1) + ' ' + u[i];
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) {}
+    document.body.removeChild(ta);
+    return ok;
+  }
+}
+
+function setProgress(p) {
+  $('bar').style.width = Math.max(0, Math.min(100, p.percent || 0)) + '%';
+  $('pctText').textContent = (p.percent || 0) + '%';
+  const sizeStr = p.total
+    ? `${fmtBytes(p.loaded)} / ${fmtBytes(p.total)}`
+    : (p.loaded ? fmtBytes(p.loaded) : '');
+  $('phase').textContent = (p.phase || p.status || '') + (sizeStr ? ` · ${sizeStr}` : '');
+}
+
+$('go').addEventListener('click', async () => {
+  const url = $('url').value.trim();
+  const key = $('key').value.trim();
+  const faststart = $('faststart').checked;
+  if (!url) { toast('URL ထည့်ပါ'); return; }
+
+  $('go').disabled = true;
+  $('go').textContent = '⏳ Uploading...';
+  $('result').hidden = false;
+  $('linkBox').hidden = true;
+  $('progressWrap').hidden = false;
+  $('bar').style.width = '0%';
+  $('pctText').textContent = '0%';
+  $('phase').textContent = 'starting...';
+  $('status').innerHTML = '⏳ <b>Uploading...</b> ဖိုင်ကြီးရင် ခဏစောင့်ပါ။';
+  $('raw').textContent = '';
+
+  try {
+    // Start job
+    const r = await fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, key, faststart }),
+    });
+    const start = await r.json();
+    if (!r.ok || !start.jobId) {
+      $('status').innerHTML = '<span class="err">❌ Failed:</span> ' + (start.error || r.status);
+      return;
+    }
+
+    // Subscribe to SSE
+    await new Promise((resolve) => {
+      const es = new EventSource(`/api/progress/${start.jobId}`);
+      es.onmessage = (ev) => {
+        let p; try { p = JSON.parse(ev.data); } catch { return; }
+        setProgress(p);
+        if (p.status === 'done') {
+          es.close();
+          const data = p.result || {};
+          $('raw').textContent = JSON.stringify(data, null, 2);
+          $('status').innerHTML = '<span class="ok">✅ Uploaded!</span> Key: <code>' + data.key + '</code>'
+            + (data.faststart ? ' · <small>faststart ✓</small>'
+               : (data.faststartRequested ? ` · <small class="err">faststart skipped (${data.faststartSkippedReason})</small>` : ''));
+
+          if (data.publicUrl) {
+            $('linkBox').hidden = false;
+            $('publicUrl').textContent = data.publicUrl;
+            copyText(data.publicUrl).then(ok =>
+              toast(ok ? 'Public link copied ✓' : 'Copy မရဘူး — ကိုယ်တိုင်နှိပ်ပါ'));
+          } else {
+            $('linkBox').hidden = false;
+            $('publicUrl').textContent =
+              '(R2_PUBLIC_BASE env မထည့်ထားလို့ public URL ပြန်မပေးနိုင်ပါ)';
+            $('copyBtn').disabled = true;
+            $('openBtn').disabled = true;
+          }
+          resolve();
+        } else if (p.status === 'error') {
+          es.close();
+          $('status').innerHTML = '<span class="err">❌ Failed:</span> ' + (p.error || 'unknown');
+          resolve();
+        }
+      };
+      es.onerror = () => {
+        es.close();
+        $('status').innerHTML = '<span class="err">❌</span> connection lost';
+        resolve();
+      };
+    });
+  } catch (e) {
+    $('status').innerHTML = '<span class="err">❌</span> ' + e.message;
+  } finally {
+    $('go').disabled = false;
+    $('go').textContent = '⬆️ Upload to R2';
+  }
+});
+
+$('copyBtn').addEventListener('click', async () => {
+  const t = $('publicUrl').textContent;
+  if (!t) return;
+  const ok = await copyText(t);
+  toast(ok ? 'Copied ✓' : 'Copy မရဘူး');
+});
+
+$('openBtn').addEventListener('click', () => {
+  const t = $('publicUrl').textContent;
+  if (t) window.open(t, '_blank', 'noopener');
+});
+
+if (navigator.share) {
+  const sb = $('shareBtn');
+  sb.style.display = '';
+  sb.addEventListener('click', async () => {
+    const t = $('publicUrl').textContent;
+    if (!t) return;
+    try { await navigator.share({ url: t, title: 'R2 file' }); } catch (_) {}
+  });
+}
+
+$('url').addEventListener('focus', async () => {
+  if ($('url').value) return;
+  try {
+    const t = await navigator.clipboard.readText();
+    if (t && /^https?:\/\//i.test(t)) $('url').value = t.trim();
+  } catch (_) {}
+});
+</script>
+</body>
+</html>
