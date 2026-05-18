@@ -32,7 +32,8 @@ if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) 
 const httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 64 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 
-// ── S3/R2 client with tuned HTTP handler (for upload speed) ──
+// ── S3/R2 client with tuned HTTP handler ──
+// Longer socket timeout + more sockets help large/slow segment uploads on Railway.
 const s3 = new S3Client({
   region: 'auto',
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -40,10 +41,11 @@ const s3 = new S3Client({
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
+  maxAttempts: 5, // SDK-level retry for transient errors
   requestHandler: new NodeHttpHandler({
-    httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 128 }),
-    connectionTimeout: 10_000,
-    socketTimeout:    120_000,
+    httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 256 }),
+    connectionTimeout: 15_000,
+    socketTimeout:    600_000, // 10 min — segments/parts can be slow on Railway
   }),
 });
 
@@ -66,13 +68,17 @@ function newJob() {
     error: null,
     listeners: new Set(),
     createdAt: Date.now(),
+    lastEmitAt: Date.now(),
   };
   jobs.set(id, job);
-  setTimeout(() => jobs.delete(id), 60 * 60 * 1000);
+  // Keep job around for 2h so reconnecting clients can still fetch final state.
+  setTimeout(() => jobs.delete(id), 2 * 60 * 60 * 1000);
   return job;
 }
+
 function emit(job, patch = {}) {
   Object.assign(job, patch);
+  job.lastEmitAt = Date.now();
   const payload = JSON.stringify({
     status: job.status,
     phase: job.phase,
@@ -86,6 +92,19 @@ function emit(job, patch = {}) {
     try { res.write(`data: ${payload}\n\n`); } catch (_) {}
   }
 }
+
+// Heartbeat: every 15s ping all SSE clients of all live jobs so the
+// proxy (Railway/Cloudflare) doesn't kill an "idle" connection between
+// progress ticks (e.g., between HLS segments).
+setInterval(() => {
+  const now = Date.now();
+  for (const job of jobs.values()) {
+    if (job.listeners.size === 0) continue;
+    for (const res of job.listeners) {
+      try { res.write(`: ping ${now}\n\n`); } catch (_) {}
+    }
+  }
+}, 15_000).unref();
 
 function pickFilename(urlStr, fallback) {
   try {
@@ -109,13 +128,15 @@ function hasFfmpeg() {
   });
 }
 
+async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 // ── Fast streamed download with progress (uses keep-alive agent) ──
 function downloadToFile(url, destPath, onProgress) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
       agent: url.startsWith('https') ? httpsAgent : httpAgent,
-      headers: { 'User-Agent': 'r2-uploader/1.2', 'Accept': '*/*' },
+      headers: { 'User-Agent': 'r2-uploader/1.3', 'Accept': '*/*' },
     }, (res) => {
       // follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
@@ -141,7 +162,7 @@ function downloadToFile(url, destPath, onProgress) {
         .catch(reject);
     });
     req.on('error', reject);
-    req.setTimeout(120_000, () => req.destroy(new Error('Download timeout')));
+    req.setTimeout(180_000, () => req.destroy(new Error('Download timeout')));
   });
 }
 
@@ -157,7 +178,6 @@ function ffmpegFaststart(inputPath, outputPath) {
 }
 
 // ── ffmpeg: produce HLS (master.m3u8 + .ts segments) ──
-// Stream copy (no re-encode) → very fast. Falls back to re-encode only if needed.
 function ffmpegHls(inputPath, outDir) {
   return new Promise((resolve, reject) => {
     const playlist = path.join(outDir, 'master.m3u8');
@@ -179,7 +199,7 @@ function ffmpegHls(inputPath, outDir) {
     p.on('error', reject);
     p.on('exit', (code) => {
       if (code === 0) return resolve(playlist);
-      // Retry with re-encode if codec copy fails (e.g., non-AAC audio)
+      // Retry with re-encode if codec copy fails
       const args2 = [
         '-y',
         '-i', inputPath,
@@ -200,30 +220,40 @@ function ffmpegHls(inputPath, outDir) {
   });
 }
 
-// ── Upload helpers ──
-async function uploadFileToR2(localPath, key, contentType, onProgress) {
+// ── Upload helpers with retry ──
+async function uploadFileToR2(localPath, key, contentType, onProgress, attempt = 1) {
   const stat = fs.statSync(localPath);
-  const body = fs.createReadStream(localPath, { highWaterMark: 1024 * 1024 });
-  const uploader = new Upload({
-    client: s3,
-    params: {
-      Bucket: R2_BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-      ContentDisposition: `attachment; filename="${path.basename(key)}"`,
-    },
-    queueSize: 4,
-    partSize: 8 * 1024 * 1024,
-  });
-  if (onProgress) {
-    uploader.on('httpUploadProgress', (p) => onProgress(p.loaded || 0, p.total || stat.size));
+  try {
+    const body = fs.createReadStream(localPath, { highWaterMark: 1024 * 1024 });
+    const uploader = new Upload({
+      client: s3,
+      params: {
+        Bucket: R2_BUCKET,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+        ContentDisposition: `attachment; filename="${path.basename(key)}"`,
+      },
+      queueSize: 4,
+      partSize: 8 * 1024 * 1024,
+      leavePartsOnError: false,
+    });
+    if (onProgress) {
+      uploader.on('httpUploadProgress', (p) => onProgress(p.loaded || 0, p.total || stat.size));
+    }
+    await uploader.done();
+    return stat.size;
+  } catch (err) {
+    if (attempt < 3) {
+      console.warn(`uploadFileToR2 retry ${attempt} for ${key}: ${err.message}`);
+      await sleep(1500 * attempt);
+      return uploadFileToR2(localPath, key, contentType, onProgress, attempt + 1);
+    }
+    throw err;
   }
-  await uploader.done();
-  return stat.size;
 }
 
-// Upload many files concurrently (for HLS segments). 6 parallel uploads.
+// Upload many files concurrently (for HLS segments) with per-part progress + retry.
 async function uploadDirToR2(dir, keyPrefix, onTick) {
   const entries = await fsp.readdir(dir);
   const files = entries.map((name) => ({
@@ -232,13 +262,19 @@ async function uploadDirToR2(dir, keyPrefix, onTick) {
     size: fs.statSync(path.join(dir, name)).size,
   }));
   const totalBytes = files.reduce((a, f) => a + f.size, 0);
-  let doneBytes = 0;
+
+  // Track per-file loaded so we can compute live totals even mid-segment.
+  const loadedPerFile = new Map(files.map((f) => [f.name, 0]));
+  const reportTick = () => {
+    let done = 0;
+    for (const v of loadedPerFile.values()) done += v;
+    if (onTick) onTick(done, totalBytes);
+  };
+
   const CONCURRENCY = 6;
 
-  async function worker(queue) {
-    while (queue.length) {
-      const f = queue.shift();
-      if (!f) break;
+  async function uploadOne(f, attempt = 1) {
+    try {
       const ct = f.name.endsWith('.m3u8')
         ? 'application/vnd.apple.mpegurl'
         : f.name.endsWith('.ts')
@@ -253,15 +289,38 @@ async function uploadDirToR2(dir, keyPrefix, onTick) {
           Key: key,
           Body: body,
           ContentType: ct,
-          // For HLS files we want inline (so players can stream them)
           CacheControl: 'public, max-age=31536000, immutable',
         },
         queueSize: 4,
         partSize: 8 * 1024 * 1024,
+        leavePartsOnError: false,
+      });
+      up.on('httpUploadProgress', (p) => {
+        loadedPerFile.set(f.name, p.loaded || 0);
+        reportTick();
       });
       await up.done();
-      doneBytes += f.size;
-      if (onTick) onTick(doneBytes, totalBytes);
+      // ensure final size counted
+      loadedPerFile.set(f.name, f.size);
+      reportTick();
+    } catch (err) {
+      if (attempt < 3) {
+        console.warn(`segment retry ${attempt} for ${f.name}: ${err.message}`);
+        await sleep(1500 * attempt);
+        // reset partial progress for this file before retry
+        loadedPerFile.set(f.name, 0);
+        reportTick();
+        return uploadOne(f, attempt + 1);
+      }
+      throw err;
+    }
+  }
+
+  async function worker(queue) {
+    while (queue.length) {
+      const f = queue.shift();
+      if (!f) break;
+      await uploadOne(f);
     }
   }
 
@@ -289,13 +348,11 @@ async function runUpload(job, { url, key, faststart, hls }) {
     const wantHls  = !!hls && ffmpegAvailable;
     const needLocalFile = wantFast || wantHls;
 
-    // Allocate progress bands based on what we'll do
-    // download : process : upload
     let band;
     if (wantHls && wantFast)      band = [0, 30, 60, 100];
     else if (wantHls)             band = [0, 35, 65, 100];
     else if (wantFast)            band = [0, 40, 60, 100];
-    else                          band = [0, 0,  0,  100]; // pure stream upload
+    else                          band = [0, 0,  0,  100];
 
     let realContentType = guessType;
     let inputSize = 0;
@@ -320,14 +377,12 @@ async function runUpload(job, { url, key, faststart, hls }) {
         await fsp.mkdir(hlsDir, { recursive: true });
         await ffmpegHls(tmpIn, hlsDir);
       } else if (wantHls && wantFast) {
-        // both: faststart first → then HLS from the faststart mp4
         await ffmpegFaststart(tmpIn, tmpFast);
         await fsp.mkdir(hlsDir, { recursive: true });
         await ffmpegHls(tmpFast, hlsDir);
       }
       emit(job, { percent: band[2] });
 
-      // ── Upload ──
       const result = {
         success: true,
         bucket: R2_BUCKET,
@@ -336,13 +391,11 @@ async function runUpload(job, { url, key, faststart, hls }) {
         hls: wantHls,
       };
 
-      // MP4 upload (skip if HLS-only requested without faststart? — we still upload MP4 as primary)
       const mp4Source = wantFast ? tmpFast : tmpIn;
       const mp4Stat = fs.statSync(mp4Source);
 
       emit(job, { status: 'uploading', phase: 'uploading MP4 to R2', percent: band[2], loaded: 0, total: mp4Stat.size });
 
-      // If we're also doing HLS, MP4 upload takes the first half of the upload band
       const uploadSpan = band[3] - band[2];
       const mp4Span = wantHls ? Math.floor(uploadSpan * 0.4) : uploadSpan;
       const hlsSpan = uploadSpan - mp4Span;
@@ -359,7 +412,6 @@ async function runUpload(job, { url, key, faststart, hls }) {
         result.publicUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(objectKey)}`;
       }
 
-      // HLS upload
       if (wantHls) {
         const hlsPrefix = stripExt(objectKey) + '_hls';
         emit(job, { phase: 'uploading HLS segments to R2', percent: band[2] + mp4Span });
@@ -368,7 +420,7 @@ async function runUpload(job, { url, key, faststart, hls }) {
           emit(job, { loaded: done, total, percent: Math.min(pct, 99) });
         });
         result.hlsPrefix = hlsPrefix;
-        result.hlsSegmentCount = count - 1; // minus the .m3u8 itself
+        result.hlsSegmentCount = Math.max(0, count - 1);
         result.hlsTotalBytes = totalBytes;
         if (R2_PUBLIC_BASE) {
           result.hlsPlaylistUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${hlsPrefix}/master.m3u8`;
@@ -377,7 +429,7 @@ async function runUpload(job, { url, key, faststart, hls }) {
 
       emit(job, { status: 'done', phase: 'completed', percent: 100, result });
     } else {
-      // ── Pure stream upload (no ffmpeg) — fastest path ──
+      // ── Pure stream upload (no ffmpeg) ──
       emit(job, { status: 'downloading', phase: 'streaming → R2', percent: 0 });
 
       const resp = await fetch(url);
@@ -398,6 +450,7 @@ async function runUpload(job, { url, key, faststart, hls }) {
         },
         queueSize: 4,
         partSize: 8 * 1024 * 1024,
+        leavePartsOnError: false,
       });
       uploader.on('httpUploadProgress', (p) => {
         const loaded = p.loaded || 0;
@@ -437,6 +490,7 @@ async function runUpload(job, { url, key, faststart, hls }) {
     console.error(err);
     emit(job, { status: 'error', error: err.message || 'Upload failed' });
   } finally {
+    // Close any remaining SSE listeners.
     for (const res of job.listeners) {
       try { res.end(); } catch (_) {}
     }
@@ -450,6 +504,7 @@ app.post('/api/upload', (req, res) => {
   const { url, key, faststart, hls } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url is required' });
   const job = newJob();
+  // Fire-and-forget; backend keeps running even if the client disconnects.
   runUpload(job, { url, key, faststart, hls }).catch(() => {});
   res.json({ jobId: job.id });
 });
@@ -464,6 +519,11 @@ app.get('/api/progress/:id', (req, res) => {
     'X-Accel-Buffering': 'no',
   });
   res.flushHeaders?.();
+
+  // Send a retry hint so EventSource auto-reconnects fast if proxy drops it.
+  res.write('retry: 3000\n\n');
+
+  // Initial snapshot
   res.write(`data: ${JSON.stringify({
     status: job.status, phase: job.phase, loaded: job.loaded,
     total: job.total, percent: job.percent, result: job.result, error: job.error,
@@ -472,6 +532,16 @@ app.get('/api/progress/:id', (req, res) => {
   if (job.status === 'done' || job.status === 'error') return res.end();
   job.listeners.add(res);
   req.on('close', () => job.listeners.delete(res));
+});
+
+// Plain JSON snapshot — useful if SSE failed and client wants to poll
+app.get('/api/status/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'not found' });
+  res.json({
+    status: job.status, phase: job.phase, loaded: job.loaded,
+    total: job.total, percent: job.percent, result: job.result, error: job.error,
+  });
 });
 
 app.get('/healthz', (_, res) => res.send('ok'));
