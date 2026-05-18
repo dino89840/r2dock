@@ -24,7 +24,7 @@
   }
   input:focus { outline:2px solid var(--brand); border-color: transparent; }
   .check {
-    margin-top: 14px; display:flex; gap:10px; align-items:flex-start;
+    margin-top: 10px; display:flex; gap:10px; align-items:flex-start;
     padding: 12px; border-radius: 10px; background:#8881; border:1px solid #8883;
   }
   .check input { width: 20px; height: 20px; margin-top:2px; }
@@ -70,11 +70,13 @@
     transition: width .25s ease;
   }
   .meta { display:flex; justify-content:space-between; font-size: 12px; opacity:.8; margin-top:6px; }
+  .link-block { margin-top: 12px; }
+  .link-block .label { font-weight:600; font-size:14px; margin-bottom:6px; }
 </style>
 </head>
 <body>
   <h1>☁️ R2 Remote Uploader</h1>
-  <p class="sub">Remote URL ထည့်ပြီး R2 bucket ထဲ တင်ပါ။ ပြီးရင် public link ကို auto-copy လုပ်ပေးမယ်။</p>
+  <p class="sub">Remote URL ထည့်ပြီး R2 bucket ထဲ တင်ပါ။ MP4 + HLS (m3u8) ပါ ထုတ်ပေးနိုင်တယ်။</p>
 
   <label for="url">Remote File URL *</label>
   <input id="url" type="url" inputmode="url" autocomplete="off"
@@ -88,7 +90,15 @@
     <input id="faststart" type="checkbox" />
     <label for="faststart">
       🚀 MP4 Fast Start ထည့်မယ်
-      <small>video play မြန်စေဖို့ moov atom ကို ဖိုင်ရှေ့ပို့ပေးမယ် (mp4/mov သာ၊ server မှာ ffmpeg လိုတယ်၊ နည်းနည်းကြာတယ်)</small>
+      <small>video play မြန်စေဖို့ moov atom ကို ဖိုင်ရှေ့ပို့ပေးမယ် (mp4/mov သာ၊ ffmpeg လိုတယ်)</small>
+    </label>
+  </div>
+
+  <div class="check">
+    <input id="hls" type="checkbox" />
+    <label for="hls">
+      🎬 HLS (m3u8) ပါထုတ်မယ်
+      <small>master.m3u8 + .ts segments ကို R2 ပေါ်ထပ်တင်ပေးမယ် (folder: <code>{name}_hls/</code>)</small>
     </label>
   </div>
 
@@ -104,17 +114,24 @@
       </div>
     </div>
 
-    <div id="linkBox" hidden>
-      <div style="margin:10px 0 6px; font-weight:600; font-size:14px;">Public URL</div>
-      <div class="row">
-        <div id="publicUrl" class="url"></div>
-      </div>
+    <div id="mp4Box" class="link-block" hidden>
+      <div class="label">📦 MP4 URL</div>
+      <div class="row"><div id="mp4Url" class="url"></div></div>
       <div class="row" style="margin-top:8px; gap:8px;">
-        <button id="copyBtn" class="secondary" style="margin:0;">📋 Copy</button>
-        <button id="openBtn" class="secondary" style="margin:0;">↗ Open</button>
-        <button id="shareBtn" class="secondary" style="margin:0; display:none;">📤 Share</button>
+        <button id="copyMp4" class="secondary" style="margin:0;">📋 Copy</button>
+        <button id="openMp4" class="secondary" style="margin:0;">↗ Open</button>
       </div>
     </div>
+
+    <div id="hlsBox" class="link-block" hidden>
+      <div class="label">🎬 HLS Playlist (m3u8)</div>
+      <div class="row"><div id="hlsUrl" class="url"></div></div>
+      <div class="row" style="margin-top:8px; gap:8px;">
+        <button id="copyHls" class="secondary" style="margin:0;">📋 Copy</button>
+        <button id="openHls" class="secondary" style="margin:0;">↗ Open</button>
+      </div>
+    </div>
+
     <details style="margin-top:12px;">
       <summary><small>Raw response</small></summary>
       <pre id="raw"></pre>
@@ -164,16 +181,38 @@ function setProgress(p) {
   $('phase').textContent = (p.phase || p.status || '') + (sizeStr ? ` · ${sizeStr}` : '');
 }
 
+function bindLinkActions() {
+  $('copyMp4').onclick = async () => {
+    const t = $('mp4Url').textContent;
+    if (!t) return;
+    toast((await copyText(t)) ? 'MP4 link copied ✓' : 'Copy မရဘူး');
+  };
+  $('openMp4').onclick = () => {
+    const t = $('mp4Url').textContent; if (t) window.open(t, '_blank', 'noopener');
+  };
+  $('copyHls').onclick = async () => {
+    const t = $('hlsUrl').textContent;
+    if (!t) return;
+    toast((await copyText(t)) ? 'HLS link copied ✓' : 'Copy မရဘူး');
+  };
+  $('openHls').onclick = () => {
+    const t = $('hlsUrl').textContent; if (t) window.open(t, '_blank', 'noopener');
+  };
+}
+bindLinkActions();
+
 $('go').addEventListener('click', async () => {
   const url = $('url').value.trim();
   const key = $('key').value.trim();
   const faststart = $('faststart').checked;
+  const hls = $('hls').checked;
   if (!url) { toast('URL ထည့်ပါ'); return; }
 
   $('go').disabled = true;
   $('go').textContent = '⏳ Uploading...';
   $('result').hidden = false;
-  $('linkBox').hidden = true;
+  $('mp4Box').hidden = true;
+  $('hlsBox').hidden = true;
   $('progressWrap').hidden = false;
   $('bar').style.width = '0%';
   $('pctText').textContent = '0%';
@@ -182,11 +221,10 @@ $('go').addEventListener('click', async () => {
   $('raw').textContent = '';
 
   try {
-    // Start job
     const r = await fetch('/api/upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, key, faststart }),
+      body: JSON.stringify({ url, key, faststart, hls }),
     });
     const start = await r.json();
     if (!r.ok || !start.jobId) {
@@ -194,7 +232,6 @@ $('go').addEventListener('click', async () => {
       return;
     }
 
-    // Subscribe to SSE
     await new Promise((resolve) => {
       const es = new EventSource(`/api/progress/${start.jobId}`);
       es.onmessage = (ev) => {
@@ -204,21 +241,37 @@ $('go').addEventListener('click', async () => {
           es.close();
           const data = p.result || {};
           $('raw').textContent = JSON.stringify(data, null, 2);
-          $('status').innerHTML = '<span class="ok">✅ Uploaded!</span> Key: <code>' + data.key + '</code>'
-            + (data.faststart ? ' · <small>faststart ✓</small>'
-               : (data.faststartRequested ? ` · <small class="err">faststart skipped (${data.faststartSkippedReason})</small>` : ''));
+
+          let tags = '';
+          if (data.faststart) tags += ' · <small>faststart ✓</small>';
+          if (data.hls) tags += ` · <small>HLS ✓ (${data.hlsSegmentCount || 0} segments)</small>`;
+          if (data.faststartRequested && !data.faststart)
+            tags += ` · <small class="err">faststart skipped</small>`;
+          if (data.hlsRequested && !data.hls)
+            tags += ` · <small class="err">HLS skipped</small>`;
+
+          $('status').innerHTML = '<span class="ok">✅ Uploaded!</span> Key: <code>' + (data.key || '') + '</code>' + tags;
 
           if (data.publicUrl) {
-            $('linkBox').hidden = false;
-            $('publicUrl').textContent = data.publicUrl;
+            $('mp4Box').hidden = false;
+            $('mp4Url').textContent = data.publicUrl;
             copyText(data.publicUrl).then(ok =>
-              toast(ok ? 'Public link copied ✓' : 'Copy မရဘူး — ကိုယ်တိုင်နှိပ်ပါ'));
-          } else {
-            $('linkBox').hidden = false;
-            $('publicUrl').textContent =
-              '(R2_PUBLIC_BASE env မထည့်ထားလို့ public URL ပြန်မပေးနိုင်ပါ)';
-            $('copyBtn').disabled = true;
-            $('openBtn').disabled = true;
+              toast(ok ? 'MP4 link copied ✓' : 'Copy မရဘူး — ကိုယ်တိုင်နှိပ်ပါ'));
+          }
+          if (data.hlsPlaylistUrl) {
+            $('hlsBox').hidden = false;
+            $('hlsUrl').textContent = data.hlsPlaylistUrl;
+          } else if (data.hls && !data.hlsPlaylistUrl) {
+            $('hlsBox').hidden = false;
+            $('hlsUrl').textContent = '(R2_PUBLIC_BASE env မထည့်ထားလို့ HLS URL ပြန်မပြနိုင်ပါ)';
+            $('copyHls').disabled = true;
+            $('openHls').disabled = true;
+          }
+          if (!data.publicUrl && !data.hlsPlaylistUrl) {
+            $('mp4Box').hidden = false;
+            $('mp4Url').textContent = '(R2_PUBLIC_BASE env မထည့်ထားလို့ public URL ပြန်မပေးနိုင်ပါ)';
+            $('copyMp4').disabled = true;
+            $('openMp4').disabled = true;
           }
           resolve();
         } else if (p.status === 'error') {
@@ -240,28 +293,6 @@ $('go').addEventListener('click', async () => {
     $('go').textContent = '⬆️ Upload to R2';
   }
 });
-
-$('copyBtn').addEventListener('click', async () => {
-  const t = $('publicUrl').textContent;
-  if (!t) return;
-  const ok = await copyText(t);
-  toast(ok ? 'Copied ✓' : 'Copy မရဘူး');
-});
-
-$('openBtn').addEventListener('click', () => {
-  const t = $('publicUrl').textContent;
-  if (t) window.open(t, '_blank', 'noopener');
-});
-
-if (navigator.share) {
-  const sb = $('shareBtn');
-  sb.style.display = '';
-  sb.addEventListener('click', async () => {
-    const t = $('publicUrl').textContent;
-    if (!t) return;
-    try { await navigator.share({ url: t, title: 'R2 file' }); } catch (_) {}
-  });
-}
 
 $('url').addEventListener('focus', async () => {
   if ($('url').value) return;
