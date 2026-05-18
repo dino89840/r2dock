@@ -213,8 +213,8 @@ async function uploadFileToR2(localPath, key, contentType, onProgress) {
       ContentType: contentType,
       ContentDisposition: `attachment; filename="${path.basename(key)}"`,
     },
-    queueSize: 8,
-    partSize: 16 * 1024 * 1024,
+    queueSize: 4,
+    partSize: 8 * 1024 * 1024,
   });
   if (onProgress) {
     uploader.on('httpUploadProgress', (p) => onProgress(p.loaded || 0, p.total || stat.size));
@@ -396,8 +396,8 @@ async function runUpload(job, { url, key, faststart, hls }) {
           ContentType: contentType,
           ContentDisposition: `attachment; filename="${objectKey}"`,
         },
-        queueSize: 8,
-        partSize: 16 * 1024 * 1024,
+        queueSize: 4,
+        partSize: 8 * 1024 * 1024,
       });
       uploader.on('httpUploadProgress', (p) => {
         const loaded = p.loaded || 0;
