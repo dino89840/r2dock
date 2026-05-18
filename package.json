@@ -1,7 +1,7 @@
 {
   "name": "r2-uploader",
-  "version": "1.1.0",
-  "description": "Remote URL to Cloudflare R2 uploader with progress + optional MP4 faststart",
+  "version": "1.2.0",
+  "description": "Remote URL to Cloudflare R2 uploader with progress, MP4 faststart, and HLS (m3u8) output",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,7 +12,9 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.645.0",
     "@aws-sdk/lib-storage": "^3.645.0",
+    "@smithy/node-http-handler": "^3.2.0",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "mime-types": "^2.1.35"
   }
 }
