@@ -30,7 +30,6 @@
   .check input { width: 20px; height: 20px; margin-top:2px; }
   .check label { margin:0; font-weight:600; font-size:14px; }
   .check small { display:block; opacity:.7; font-weight:400; margin-top:2px; }
-  .group-title { margin-top:18px; font-weight:700; font-size:13px; opacity:.8; text-transform:uppercase; letter-spacing:.5px; }
   button {
     margin-top: 18px; width: 100%; padding: 14px;
     font-size: 16px; font-weight: 600;
@@ -77,39 +76,29 @@
 </head>
 <body>
   <h1>☁️ R2 Remote Uploader</h1>
-  <p class="sub">Remote URL ထည့်ပြီး R2 bucket ထဲ တင်ပါ။ MP4 + HLS (m3u8) ကို သီးခြားစီ ရွေးတင်နိုင်တယ်။</p>
+  <p class="sub">Remote URL ထည့်ပြီး R2 bucket ထဲ တင်ပါ။ MP4 + HLS (m3u8) ပါ ထုတ်ပေးနိုင်တယ်။</p>
 
   <label for="url">Remote File URL *</label>
   <input id="url" type="url" inputmode="url" autocomplete="off"
-         placeholder="https://example.com/video.mp4 (သို့) https://.../master.m3u8" />
+         placeholder="https://example.com/video.mp4" />
 
   <label for="key">Object Key (optional)</label>
   <input id="key" type="text" autocomplete="off"
          placeholder="folder/myfile.mp4" />
 
-  <div class="group-title">📤 R2 ကို ဘာတင်မလဲ ရွေးပါ</div>
-
   <div class="check">
-    <input id="outMp4" type="checkbox" checked />
-    <label for="outMp4">
-      📦 MP4 တင်မယ်
-      <small>Source က m3u8 ဆိုရင် ffmpeg နဲ့ MP4 ပြောင်းပြီး တင်ပေးမယ်</small>
-    </label>
-  </div>
-
-  <div class="check">
-    <input id="outHls" type="checkbox" />
-    <label for="outHls">
-      🎬 HLS (m3u8) တင်မယ်
-      <small>Source က MP4 ဆိုရင် ffmpeg နဲ့ HLS segment ထုတ်တင်မယ်။ Source က m3u8 ဆိုရင် segment တွေပါ R2 ပေါ် mirror လုပ်မယ် (folder: <code>{name}_hls/</code>)</small>
-    </label>
-  </div>
-
-  <div class="check">
-    <input id="faststart" type="checkbox" checked />
+    <input id="faststart" type="checkbox" />
     <label for="faststart">
-      🚀 MP4 Fast Start
-      <small>video play မြန်စေဖို့ moov atom ကို ဖိုင်ရှေ့ပို့ပေးမယ် (mp4 output အတွက်သာ၊ ffmpeg လိုတယ်)</small>
+      🚀 MP4 Fast Start ထည့်မယ်
+      <small>video play မြန်စေဖို့ moov atom ကို ဖိုင်ရှေ့ပို့ပေးမယ် (mp4/mov သာ၊ ffmpeg လိုတယ်)</small>
+    </label>
+  </div>
+
+  <div class="check">
+    <input id="hls" type="checkbox" />
+    <label for="hls">
+      🎬 HLS (m3u8) ပါထုတ်မယ်
+      <small>master.m3u8 + .ts segments ကို R2 ပေါ်ထပ်တင်ပေးမယ် (folder: <code>{name}_hls/</code>)</small>
     </label>
   </div>
 
@@ -216,10 +205,8 @@ $('go').addEventListener('click', async () => {
   const url = $('url').value.trim();
   const key = $('key').value.trim();
   const faststart = $('faststart').checked;
-  const outMp4 = $('outMp4').checked;
-  const outHls = $('outHls').checked;
+  const hls = $('hls').checked;
   if (!url) { toast('URL ထည့်ပါ'); return; }
-  if (!outMp4 && !outHls) { toast('MP4 (သို့) HLS တစ်ခုခု ရွေးပါ'); return; }
 
   $('go').disabled = true;
   $('go').textContent = '⏳ Uploading...';
@@ -237,7 +224,7 @@ $('go').addEventListener('click', async () => {
     const r = await fetch('/api/upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, key, faststart, outMp4, outHls }),
+      body: JSON.stringify({ url, key, faststart, hls }),
     });
     const start = await r.json();
     if (!r.ok || !start.jobId) {
@@ -258,26 +245,19 @@ $('go').addEventListener('click', async () => {
           let tags = '';
           if (data.faststart) tags += ' · <small>faststart ✓</small>';
           if (data.hls) tags += ` · <small>HLS ✓ (${data.hlsSegmentCount || 0} segments)</small>`;
-          if (data.mp4) tags += ' · <small>MP4 ✓</small>';
-          if (data.mp4Requested && !data.mp4)
-            tags += ` · <small class="err">MP4 skipped</small>`;
+          if (data.faststartRequested && !data.faststart)
+            tags += ` · <small class="err">faststart skipped</small>`;
           if (data.hlsRequested && !data.hls)
             tags += ` · <small class="err">HLS skipped</small>`;
 
-          $('status').innerHTML = '<span class="ok">✅ Uploaded!</span> Source: <code>' + (data.sourceType || '?') + '</code>' + tags;
+          $('status').innerHTML = '<span class="ok">✅ Uploaded!</span> Key: <code>' + (data.key || '') + '</code>' + tags;
 
           if (data.publicUrl) {
             $('mp4Box').hidden = false;
             $('mp4Url').textContent = data.publicUrl;
             copyText(data.publicUrl).then(ok =>
               toast(ok ? 'MP4 link copied ✓' : 'Copy မရဘူး — ကိုယ်တိုင်နှိပ်ပါ'));
-          } else if (data.mp4Requested && !data.mp4) {
-            $('mp4Box').hidden = false;
-            $('mp4Url').textContent = '(MP4 မထွက်နိုင်ပါ — ' + (data.skippedReason || 'unknown') + ')';
-            $('copyMp4').disabled = true;
-            $('openMp4').disabled = true;
           }
-
           if (data.hlsPlaylistUrl) {
             $('hlsBox').hidden = false;
             $('hlsUrl').textContent = data.hlsPlaylistUrl;
@@ -286,6 +266,12 @@ $('go').addEventListener('click', async () => {
             $('hlsUrl').textContent = '(R2_PUBLIC_BASE env မထည့်ထားလို့ HLS URL ပြန်မပြနိုင်ပါ)';
             $('copyHls').disabled = true;
             $('openHls').disabled = true;
+          }
+          if (!data.publicUrl && !data.hlsPlaylistUrl) {
+            $('mp4Box').hidden = false;
+            $('mp4Url').textContent = '(R2_PUBLIC_BASE env မထည့်ထားလို့ public URL ပြန်မပေးနိုင်ပါ)';
+            $('copyMp4').disabled = true;
+            $('openMp4').disabled = true;
           }
           resolve();
         } else if (p.status === 'error') {
