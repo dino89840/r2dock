@@ -137,7 +137,7 @@ function downloadToFile(url, destPath, onProgress) {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
       agent: url.startsWith('https') ? httpsAgent : httpAgent,
-      headers: { 'User-Agent': 'r2-uploader/1.4', 'Accept': '*/*' },
+      headers: { 'User-Agent': 'r2-uploader/1.5', 'Accept': '*/*' },
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -166,13 +166,13 @@ function downloadToFile(url, destPath, onProgress) {
   });
 }
 
-// ── Download URL to buffer (for text files like m3u8) ──
+// ── Download URL to text (for m3u8) ──
 function fetchText(url, attempt = 1) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
       agent: url.startsWith('https') ? httpsAgent : httpAgent,
-      headers: { 'User-Agent': 'r2-uploader/1.4', 'Accept': '*/*' },
+      headers: { 'User-Agent': 'r2-uploader/1.5', 'Accept': '*/*' },
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -215,7 +215,7 @@ function ffmpegFaststart(inputPath, outputPath) {
   });
 }
 
-// ── ffmpeg: produce HLS (master.m3u8 + .ts segments) ──
+// ── ffmpeg: produce HLS (master.m3u8 + .ts segments) from local file ──
 function ffmpegHls(inputPath, outDir) {
   return new Promise((resolve, reject) => {
     const playlist = path.join(outDir, 'master.m3u8');
@@ -262,7 +262,7 @@ function ffmpegHlsToMp4(inputUrlOrPath, outputPath, faststart = true) {
   return new Promise((resolve, reject) => {
     const args = [
       '-y',
-      '-headers', 'User-Agent: r2-uploader/1.4\r\n',
+      '-headers', 'User-Agent: r2-uploader/1.5\r\n',
       '-i', inputUrlOrPath,
       '-c', 'copy',
       '-bsf:a', 'aac_adtstoasc',
@@ -278,7 +278,7 @@ function ffmpegHlsToMp4(inputUrlOrPath, outputPath, faststart = true) {
       // Retry with re-encode
       const args2 = [
         '-y',
-        '-headers', 'User-Agent: r2-uploader/1.4\r\n',
+        '-headers', 'User-Agent: r2-uploader/1.5\r\n',
         '-i', inputUrlOrPath,
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
@@ -417,32 +417,8 @@ async function uploadDirToR2(dir, keyPrefix, onTick) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// HLS MIRROR: download playlist + segments, rewrite, upload to R2
+// HLS MIRROR helpers
 // ═══════════════════════════════════════════════════════════════
-
-// Returns array of "resource lines" from a playlist (segment URIs + key URIs + map URIs)
-function parsePlaylistResources(text) {
-  const lines = text.split(/\r?\n/);
-  const resources = []; // { type: 'segment'|'key'|'map'|'variant', uri }
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith('#')) {
-      // EXT-X-KEY:URI="..."
-      const keyMatch = line.match(/#EXT-X-KEY:[^]*?URI="([^"]+)"/i);
-      if (keyMatch) resources.push({ type: 'key', uri: keyMatch[1] });
-      const mapMatch = line.match(/#EXT-X-MAP:[^]*?URI="([^"]+)"/i);
-      if (mapMatch) resources.push({ type: 'map', uri: mapMatch[1] });
-      // EXT-X-MEDIA:URI="..." (alternate audio etc.)
-      const mediaMatch = line.match(/#EXT-X-MEDIA:[^]*?URI="([^"]+)"/i);
-      if (mediaMatch) resources.push({ type: 'variant', uri: mediaMatch[1] });
-    } else {
-      // either segment or variant playlist URI
-      resources.push({ type: 'uri', uri: line });
-    }
-  }
-  return resources;
-}
 
 function isMasterPlaylist(text) {
   return /#EXT-X-STREAM-INF/i.test(text);
@@ -452,8 +428,6 @@ function resolveUrl(base, ref) {
   try { return new URL(ref, base).toString(); } catch { return ref; }
 }
 
-// Map a downloaded resource URL to a flat local filename inside the prefix folder.
-// We hash long URLs to avoid collisions, but keep the extension.
 function localNameFor(url, kind, index) {
   const u = (() => { try { return new URL(url); } catch { return null; } })();
   const pathname = u ? u.pathname : url;
@@ -481,13 +455,12 @@ function guessContentType(name) {
   return mime.lookup(name) || 'application/octet-stream';
 }
 
-// Download a single resource into memory (small) or to file (segments).
 function downloadBuffer(url, attempt = 1) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
       agent: url.startsWith('https') ? httpsAgent : httpAgent,
-      headers: { 'User-Agent': 'r2-uploader/1.4', 'Accept': '*/*' },
+      headers: { 'User-Agent': 'r2-uploader/1.5', 'Accept': '*/*' },
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -513,33 +486,19 @@ function downloadBuffer(url, attempt = 1) {
   });
 }
 
-/**
- * Mirror an HLS playlist tree to R2.
- * - Handles master playlists (recurses into variants).
- * - Handles media playlists (segments, keys, init maps).
- * - Rewrites all URIs to relative filenames within keyPrefix.
- *
- * Returns: { masterKey, segmentCount, totalBytes }
- */
 async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
-  const visited = new Map(); // playlistUrl -> localPlaylistName
+  const visited = new Map();
   let segmentCount = 0;
   let totalBytes = 0;
-  // Track resources we've already uploaded (dedupe by URL)
-  const uploadedRes = new Map(); // url -> localName
+  const uploadedRes = new Map();
 
-  // First pass: discover all resources (recursively) to compute total work for progress.
-  // Second pass: actually download/upload.
-  // For simplicity & correctness we do it in one pass with live progress.
-
-  let approxBytes = 0;     // running uploaded bytes
-  let approxTotal = 0;     // best-effort estimate (updated as we discover)
+  let approxBytes = 0;
+  let approxTotal = 0;
   let resourcesSeen = 0;
   let resourcesDone = 0;
 
   const tick = () => {
     if (!onTick) return;
-    // If we don't have total bytes yet, fall back to resource count ratio
     const denom = approxTotal > 0 ? approxTotal : Math.max(resourcesSeen, 1);
     const num   = approxTotal > 0 ? approxBytes : resourcesDone;
     onTick(num, denom);
@@ -556,8 +515,7 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
     const lines = text.split(/\r?\n/);
     const rewritten = [];
 
-    // Discover sub-resources first (so we can rewrite URIs as we go)
-    const tasks = []; // {kind, absUrl, replaceFn(localName)}
+    const tasks = [];
     const isMaster = isMasterPlaylist(text);
 
     for (let i = 0; i < lines.length; i++) {
@@ -567,7 +525,6 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
       if (!line) { rewritten.push(raw); continue; }
 
       if (line.startsWith('#')) {
-        // Rewrite URI="..." in tags
         let newLine = raw;
         const tagMatches = [
           /#EXT-X-KEY:.*?URI="([^"]+)"/i,
@@ -585,16 +542,11 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
                         : 'variant';
             resourcesSeen++;
             if (kind === 'variant' && /\.m3u8/i.test(ref)) {
-              // It's a sub-playlist; recurse later, replace with its local name.
               tasks.push({
                 kind: 'subplaylist',
                 absUrl,
-                replace: async () => {
-                  const sub = await processPlaylist(absUrl, false);
-                  return sub;
-                },
+                replace: async () => processPlaylist(absUrl, false),
               });
-              // Placeholder; we'll rewrite at the end.
               newLine = newLine.replace(re, (full, g1) => full.replace(`"${g1}"`, `"__SUB_${tasks.length - 1}__"`));
             } else {
               tasks.push({ kind, absUrl, isText: false });
@@ -606,7 +558,6 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
         continue;
       }
 
-      // Non-comment line: either a segment URI or a variant playlist URI
       const absUrl = resolveUrl(baseUrl, line);
       resourcesSeen++;
       if (isMaster || /\.m3u8(\?|$)/i.test(line)) {
@@ -622,7 +573,6 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
       }
     }
 
-    // Execute tasks with controlled concurrency
     const CONCURRENCY = 6;
     const resolved = new Array(tasks.length);
 
@@ -639,14 +589,12 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
             resourcesDone++;
             tick();
           } else {
-            // Dedupe
             if (uploadedRes.has(t.absUrl)) {
               resolved[myIdx] = uploadedRes.get(t.absUrl);
               resourcesDone++;
               tick();
               continue;
             }
-            // Segment kind needs a unique sequential name
             const idx = t.kind === 'segment' ? ++segmentCount : 0;
             const lname = localNameFor(t.absUrl, t.kind, idx);
             const { buffer, size } = await downloadBuffer(t.absUrl);
@@ -670,7 +618,6 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
     const workers = Array.from({ length: Math.min(CONCURRENCY, tasks.length || 1) }, workerLoop);
     await Promise.all(workers);
 
-    // Substitute placeholders
     const finalLines = rewritten.map((ln) => {
       let out = ln;
       out = out.replace(/__SUB_(\d+)__/g, (_, n) => resolved[Number(n)] || '');
@@ -679,7 +626,6 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
     });
     const finalText = finalLines.join('\n');
 
-    // Upload playlist itself
     await uploadBufferToR2(
       Buffer.from(finalText, 'utf8'),
       `${keyPrefix}/${localName}`,
@@ -694,73 +640,57 @@ async function mirrorHlsToR2(rootUrl, keyPrefix, onTick) {
   return { masterKey: `${keyPrefix}/${masterLocalName}`, segmentCount, totalBytes };
 }
 
-// ── Main job runner ──
-async function runUpload(job, { url, key, faststart, hls }) {
+// ═══════════════════════════════════════════════════════════════
+// Main job runner
+// ═══════════════════════════════════════════════════════════════
+async function runUpload(job, { url, key, faststart, outMp4, outHls }) {
   const tmpRoot = path.join(os.tmpdir(), `r2-${job.id}`);
   await fsp.mkdir(tmpRoot, { recursive: true });
-  const tmpIn = path.join(tmpRoot, 'input');
+  const tmpIn   = path.join(tmpRoot, 'input');
   const tmpFast = path.join(tmpRoot, 'fast.mp4');
-  const tmpMp4 = path.join(tmpRoot, 'converted.mp4');
-  const hlsDir = path.join(tmpRoot, 'hls');
+  const tmpMp4  = path.join(tmpRoot, 'converted.mp4');
+  const hlsDir  = path.join(tmpRoot, 'hls');
+
+  // Default: at least produce MP4 if user picked nothing
+  if (!outMp4 && !outHls) outMp4 = true;
 
   try {
     const objectKey = (key && key.trim()) || pickFilename(url);
     const guessType = mime.lookup(objectKey) || 'application/octet-stream';
-    const isMp4Like = /\.(mp4|m4v|mov)$/i.test(objectKey) || /mp4|quicktime|m4v/i.test(guessType);
-
     const ffmpegAvailable = await hasFfmpeg();
 
-    // ── Detect HLS source ──
-    // Try by URL first; if ambiguous, peek at Content-Type via a HEAD-ish small fetch.
-    let sourceIsHls = isHlsUrl(url);
+    // Detect source type
+    const sourceIsHls = isHlsUrl(url);
+
+    const result = {
+      success: true,
+      bucket: R2_BUCKET,
+      key: objectKey,
+      sourceType: sourceIsHls ? 'hls' : 'file',
+      mp4: false,
+      hls: false,
+      faststart: false,
+      mp4Requested: !!outMp4,
+      hlsRequested: !!outHls,
+      faststartRequested: !!faststart,
+    };
 
     // ════════════════════════════════════════════════════════════
     // BRANCH A: Source is HLS (.m3u8)
     // ════════════════════════════════════════════════════════════
     if (sourceIsHls) {
-      // What does the user want as OUTPUT?
-      // - `hls` checked  → mirror HLS to R2 (no ffmpeg needed)
-      // - `hls` unchecked → convert to MP4 (needs ffmpeg)
-      // - both           → do both
-      // If neither is feasible (e.g. ffmpeg missing and they unchecked HLS),
-      // we still default to mirror so user gets a usable result.
-      const wantHlsMirror = !!hls || !ffmpegAvailable;
-      const wantMp4       = !hls || !!faststart;
-      // If user unchecked HLS but also unchecked faststart, they likely want MP4.
-      // Re-evaluate: wantMp4 should reflect "produce an MP4 output".
-      const userWantsMp4 = !hls; // they didn't tick HLS → they want MP4
-      const userWantsHls = !!hls;
-
-      const doHls = userWantsHls;
-      const doMp4 = userWantsMp4 || (!userWantsHls); // always at least one output
-      // Cleaner:
-      const finalDoHls = userWantsHls;
-      const finalDoMp4 = userWantsMp4;
-      // If user ticked only HLS, only mirror. If only MP4 (default), only MP4.
-      // If both ticked, do both.
-
+      // Progress band split
       let band;
-      if (finalDoHls && finalDoMp4)      band = [0, 50, 100];
-      else                                band = [0, 100];
-
-      const result = {
-        success: true,
-        bucket: R2_BUCKET,
-        key: objectKey,
-        sourceType: 'hls',
-        hls: false,
-        faststart: false,
-        hlsRequested: !!hls,
-        faststartRequested: !!faststart,
-      };
+      if (outMp4 && outHls)      band = [0, 50, 100];
+      else                        band = [0, 100];
 
       // ── HLS mirror ──
-      if (finalDoHls) {
+      if (outHls) {
         const hlsPrefix = stripExt(objectKey) + '_hls';
         emit(job, { status: 'processing', phase: 'mirroring HLS playlist + segments to R2', percent: 0, loaded: 0, total: 0 });
-        const span = finalDoMp4 ? band[1] - band[0] : 100;
+        const span = outMp4 ? band[1] - band[0] : 100;
         const startPct = 0;
-        const { masterKey, segmentCount, totalBytes } = await mirrorHlsToR2(url, hlsPrefix, (done, total) => {
+        const { segmentCount, totalBytes } = await mirrorHlsToR2(url, hlsPrefix, (done, total) => {
           const pct = total ? Math.floor(startPct + (done / total) * span) : startPct;
           emit(job, { loaded: done, total, percent: Math.min(pct, startPct + span - 1) });
         });
@@ -771,38 +701,44 @@ async function runUpload(job, { url, key, faststart, hls }) {
         if (R2_PUBLIC_BASE) {
           result.hlsPlaylistUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${hlsPrefix}/master.m3u8`;
         }
-        emit(job, { percent: finalDoMp4 ? band[1] : 99 });
+        emit(job, { percent: outMp4 ? band[1] : 99 });
       }
 
       // ── HLS → MP4 ──
-      if (finalDoMp4) {
+      if (outMp4) {
         if (!ffmpegAvailable) {
-          throw new Error('HLS → MP4 အတွက် ffmpeg မရှိပါ။ HLS checkbox ကိုသာ ဖွင့်ပြီး mirror လုပ်နိုင်ပါတယ်။');
+          if (outHls) {
+            // HLS already done; just skip MP4 with reason
+            result.skippedReason = 'ffmpeg not available for HLS→MP4 conversion';
+          } else {
+            throw new Error('HLS → MP4 အတွက် ffmpeg မရှိပါ။ HLS checkbox ကိုသာ ဖွင့်ပြီး mirror လုပ်နိုင်ပါတယ်။');
+          }
+        } else {
+          const startPct = outHls ? band[1] : band[0];
+          const endPct   = outHls ? band[2] : band[1];
+
+          emit(job, { status: 'processing', phase: 'converting HLS → MP4 (ffmpeg)', percent: startPct, loaded: 0, total: 0 });
+          await ffmpegHlsToMp4(url, tmpMp4, !!faststart);
+
+          const mp4Key = /\.(mp4|m4v|mov)$/i.test(objectKey) ? objectKey : (stripExt(objectKey) + '.mp4');
+          const mp4Stat = fs.statSync(tmpMp4);
+
+          emit(job, { status: 'uploading', phase: 'uploading MP4 to R2', percent: startPct, loaded: 0, total: mp4Stat.size });
+          const span = Math.max(1, endPct - startPct);
+          await uploadFileToR2(tmpMp4, mp4Key, 'video/mp4', (loaded, total) => {
+            const pct = total ? Math.floor(startPct + (loaded / total) * span) : startPct;
+            emit(job, { loaded, total, percent: Math.min(pct, endPct - 1) });
+          });
+          result.mp4 = true;
+          result.mp4Key = mp4Key;
+          result.contentType = 'video/mp4';
+          result.contentLength = mp4Stat.size;
+          result.faststart = !!faststart;
+          if (R2_PUBLIC_BASE) {
+            result.publicUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(mp4Key)}`;
+          }
+          result.key = mp4Key;
         }
-        const startPct = finalDoHls ? band[1] : band[0];
-        const endPct   = finalDoHls ? band[2] : band[1];
-
-        emit(job, { status: 'processing', phase: 'converting HLS → MP4 (ffmpeg)', percent: startPct, loaded: 0, total: 0 });
-        // ffmpeg can read .m3u8 directly over HTTP(S).
-        await ffmpegHlsToMp4(url, tmpMp4, !!faststart);
-
-        const mp4Key = /\.(mp4|m4v|mov)$/i.test(objectKey) ? objectKey : (stripExt(objectKey) + '.mp4');
-        const mp4Stat = fs.statSync(tmpMp4);
-
-        emit(job, { status: 'uploading', phase: 'uploading MP4 to R2', percent: startPct, loaded: 0, total: mp4Stat.size });
-        const span = Math.max(1, endPct - startPct);
-        await uploadFileToR2(tmpMp4, mp4Key, 'video/mp4', (loaded, total) => {
-          const pct = total ? Math.floor(startPct + (loaded / total) * span) : startPct;
-          emit(job, { loaded, total, percent: Math.min(pct, endPct - 1) });
-        });
-        result.mp4Key = mp4Key;
-        result.contentType = 'video/mp4';
-        result.contentLength = mp4Stat.size;
-        result.faststart = !!faststart;
-        if (R2_PUBLIC_BASE) {
-          result.publicUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(mp4Key)}`;
-        }
-        result.key = mp4Key;
       }
 
       emit(job, { status: 'done', phase: 'completed', percent: 100, result });
@@ -810,75 +746,79 @@ async function runUpload(job, { url, key, faststart, hls }) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // BRANCH B: Source is a regular file (mp4/etc.) — original logic
+    // BRANCH B: Source is regular file (mp4/etc.)
     // ════════════════════════════════════════════════════════════
-    const wantFast = !!faststart && isMp4Like && ffmpegAvailable;
-    const wantHls  = !!hls && ffmpegAvailable;
+    const isMp4Like = /\.(mp4|m4v|mov)$/i.test(objectKey) || /mp4|quicktime|m4v/i.test(guessType);
+    const wantFast = !!faststart && outMp4 && isMp4Like && ffmpegAvailable;
+    const wantHls  = !!outHls && ffmpegAvailable;
     const needLocalFile = wantFast || wantHls;
 
+    // If user wants neither MP4 nor any local processing and no HLS, just stream-upload as raw MP4.
+    // If user wants only HLS but ffmpeg not available, we still must download to do nothing useful — error out.
+    if (outHls && !ffmpegAvailable && !outMp4) {
+      throw new Error('HLS output အတွက် ffmpeg လိုပါတယ်။ Server မှာ ffmpeg မရှိပါ။');
+    }
+
+    // Progress band design:
+    // - download : 0 .. D
+    // - process  : D .. P
+    // - upload mp4 : P .. (P + Mspan)
+    // - upload hls : (P + Mspan) .. 100
     let band;
-    if (wantHls && wantFast)      band = [0, 30, 60, 100];
-    else if (wantHls)             band = [0, 35, 65, 100];
-    else if (wantFast)            band = [0, 40, 60, 100];
-    else                          band = [0, 0,  0,  100];
+    if (wantHls && wantFast)            band = [0, 30, 60, 100];
+    else if (wantHls)                   band = [0, 35, 65, 100];
+    else if (wantFast)                  band = [0, 40, 60, 100];
+    else                                band = [0, 0,  0,  100];
 
     let realContentType = guessType;
-    let inputSize = 0;
 
     if (needLocalFile) {
       emit(job, { status: 'downloading', phase: 'downloading', percent: band[0] });
-      const { total, contentType } = await downloadToFile(url, tmpIn, (loaded, total) => {
+      const { contentType } = await downloadToFile(url, tmpIn, (loaded, total) => {
         const span = band[1] - band[0];
         const pct = total ? Math.floor(band[0] + (loaded / total) * span) : band[0];
         emit(job, { loaded, total, percent: Math.min(pct, band[1]) });
       });
       realContentType = contentType || guessType;
-      inputSize = total;
 
       emit(job, { status: 'processing', phase: wantHls ? 'transcoding to HLS' : 'faststart (ffmpeg)', percent: band[1] });
 
-      if (wantFast && !wantHls) {
+      // Produce faststart MP4 if needed (used for both MP4 upload AND HLS source)
+      if (wantFast) {
         await ffmpegFaststart(tmpIn, tmpFast);
-      } else if (wantHls && !wantFast) {
+      }
+      if (wantHls) {
         await fsp.mkdir(hlsDir, { recursive: true });
-        await ffmpegHls(tmpIn, hlsDir);
-      } else if (wantHls && wantFast) {
-        await ffmpegFaststart(tmpIn, tmpFast);
-        await fsp.mkdir(hlsDir, { recursive: true });
-        await ffmpegHls(tmpFast, hlsDir);
+        await ffmpegHls(wantFast ? tmpFast : tmpIn, hlsDir);
       }
       emit(job, { percent: band[2] });
 
-      const result = {
-        success: true,
-        bucket: R2_BUCKET,
-        key: objectKey,
-        sourceType: 'file',
-        faststart: wantFast,
-        hls: wantHls,
-      };
-
-      const mp4Source = wantFast ? tmpFast : tmpIn;
-      const mp4Stat = fs.statSync(mp4Source);
-
-      emit(job, { status: 'uploading', phase: 'uploading MP4 to R2', percent: band[2], loaded: 0, total: mp4Stat.size });
-
+      // ── Upload MP4 (if requested) ──
       const uploadSpan = band[3] - band[2];
-      const mp4Span = wantHls ? Math.floor(uploadSpan * 0.4) : uploadSpan;
-      const hlsSpan = uploadSpan - mp4Span;
+      let mp4Span = 0, hlsSpan = uploadSpan;
+      if (outMp4 && wantHls) { mp4Span = Math.floor(uploadSpan * 0.4); hlsSpan = uploadSpan - mp4Span; }
+      else if (outMp4 && !wantHls) { mp4Span = uploadSpan; hlsSpan = 0; }
+      else if (!outMp4 && wantHls) { mp4Span = 0; hlsSpan = uploadSpan; }
 
-      await uploadFileToR2(mp4Source, objectKey, realContentType, (loaded, total) => {
-        const pct = total ? Math.floor(band[2] + (loaded / total) * mp4Span) : band[2];
-        emit(job, { loaded, total, percent: Math.min(pct, band[2] + mp4Span) });
-      });
-
-      result.mp4Key = objectKey;
-      result.contentType = realContentType;
-      result.contentLength = mp4Stat.size;
-      if (R2_PUBLIC_BASE) {
-        result.publicUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(objectKey)}`;
+      if (outMp4) {
+        const mp4Source = wantFast ? tmpFast : tmpIn;
+        const mp4Stat = fs.statSync(mp4Source);
+        emit(job, { status: 'uploading', phase: 'uploading MP4 to R2', percent: band[2], loaded: 0, total: mp4Stat.size });
+        await uploadFileToR2(mp4Source, objectKey, realContentType, (loaded, total) => {
+          const pct = total ? Math.floor(band[2] + (loaded / total) * mp4Span) : band[2];
+          emit(job, { loaded, total, percent: Math.min(pct, band[2] + mp4Span) });
+        });
+        result.mp4 = true;
+        result.mp4Key = objectKey;
+        result.contentType = realContentType;
+        result.contentLength = mp4Stat.size;
+        result.faststart = wantFast;
+        if (R2_PUBLIC_BASE) {
+          result.publicUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(objectKey)}`;
+        }
       }
 
+      // ── Upload HLS (if requested) ──
       if (wantHls) {
         const hlsPrefix = stripExt(objectKey) + '_hls';
         emit(job, { phase: 'uploading HLS segments to R2', percent: band[2] + mp4Span });
@@ -886,17 +826,20 @@ async function runUpload(job, { url, key, faststart, hls }) {
           const pct = total ? Math.floor((band[2] + mp4Span) + (done / total) * hlsSpan) : (band[2] + mp4Span);
           emit(job, { loaded: done, total, percent: Math.min(pct, 99) });
         });
+        result.hls = true;
         result.hlsPrefix = hlsPrefix;
         result.hlsSegmentCount = Math.max(0, count - 1);
         result.hlsTotalBytes = totalBytes;
         if (R2_PUBLIC_BASE) {
           result.hlsPlaylistUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${hlsPrefix}/master.m3u8`;
         }
+      } else if (outHls && !ffmpegAvailable) {
+        result.skippedReason = 'ffmpeg not available';
       }
 
       emit(job, { status: 'done', phase: 'completed', percent: 100, result });
     } else {
-      // Pure stream upload
+      // Pure stream upload (MP4 only, no faststart, no HLS)
       emit(job, { status: 'downloading', phase: 'streaming → R2', percent: 0 });
 
       const resp = await fetch(url);
@@ -904,32 +847,10 @@ async function runUpload(job, { url, key, faststart, hls }) {
       const contentType = resp.headers.get('content-type') || guessType;
       const contentLength = Number(resp.headers.get('content-length')) || 0;
 
-      // If the server says this is actually an m3u8, fall back to HLS branch.
+      // If server says it's actually an m3u8, redirect to HLS branch logic.
       if (isHlsUrl(url, contentType)) {
-        // re-invoke with HLS detection (rare path)
-        // Simplest: just call mirror flow now.
-        const hlsPrefix = stripExt(objectKey) + '_hls';
-        emit(job, { status: 'processing', phase: 'mirroring HLS playlist + segments to R2', percent: 0, loaded: 0, total: 0 });
-        const { segmentCount, totalBytes } = await mirrorHlsToR2(url, hlsPrefix, (done, total) => {
-          const pct = total ? Math.floor((done / total) * 99) : 0;
-          emit(job, { loaded: done, total, percent: pct });
-        });
-        const result = {
-          success: true,
-          bucket: R2_BUCKET,
-          key: objectKey,
-          sourceType: 'hls',
-          hls: true,
-          faststart: false,
-          hlsPrefix,
-          hlsSegmentCount: segmentCount,
-          hlsTotalBytes: totalBytes,
-        };
-        if (R2_PUBLIC_BASE) {
-          result.hlsPlaylistUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${hlsPrefix}/master.m3u8`;
-        }
-        emit(job, { status: 'done', phase: 'completed', percent: 100, result });
-        return;
+        // Re-run as HLS source
+        return runUpload(job, { url, key, faststart, outMp4, outHls });
       }
 
       emit(job, { status: 'uploading', phase: 'uploading to R2', total: contentLength, loaded: 0, percent: 0 });
@@ -955,32 +876,17 @@ async function runUpload(job, { url, key, faststart, hls }) {
       });
       await uploader.done();
 
-      const publicUrl = R2_PUBLIC_BASE
-        ? `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(objectKey)}`
-        : null;
+      result.mp4 = true;
+      result.mp4Key = objectKey;
+      result.contentType = contentType;
+      result.contentLength = contentLength || null;
+      result.faststart = false;
+      if (R2_PUBLIC_BASE) {
+        result.publicUrl = `${R2_PUBLIC_BASE.replace(/\/$/, '')}/${encodeURIComponent(objectKey)}`;
+      }
+      if (outHls && !ffmpegAvailable) result.skippedReason = 'ffmpeg not available';
 
-      emit(job, {
-        status: 'done',
-        phase: 'completed',
-        percent: 100,
-        result: {
-          success: true,
-          bucket: R2_BUCKET,
-          key: objectKey,
-          mp4Key: objectKey,
-          contentType,
-          contentLength: contentLength || null,
-          publicUrl,
-          faststart: false,
-          hls: false,
-          faststartRequested: !!faststart,
-          hlsRequested: !!hls,
-          sourceType: 'file',
-          skippedReason: (faststart || hls)
-            ? (ffmpegAvailable ? 'not an mp4/mov file' : 'ffmpeg not available')
-            : undefined,
-        },
-      });
+      emit(job, { status: 'done', phase: 'completed', percent: 100, result });
     }
   } catch (err) {
     console.error(err);
@@ -996,10 +902,19 @@ async function runUpload(job, { url, key, faststart, hls }) {
 
 // ── Routes ──
 app.post('/api/upload', (req, res) => {
-  const { url, key, faststart, hls } = req.body || {};
+  const { url, key, faststart, outMp4, outHls, hls } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url is required' });
+  // Backward-compat: old clients send `hls` only.
+  const finalOutMp4 = (typeof outMp4 === 'boolean') ? outMp4 : true;
+  const finalOutHls = (typeof outHls === 'boolean') ? outHls : !!hls;
   const job = newJob();
-  runUpload(job, { url, key, faststart, hls }).catch(() => {});
+  runUpload(job, {
+    url,
+    key,
+    faststart: !!faststart,
+    outMp4: finalOutMp4,
+    outHls: finalOutHls,
+  }).catch(() => {});
   res.json({ jobId: job.id });
 });
 
