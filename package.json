@@ -1,6 +1,6 @@
 {
   "name": "r2-uploader",
-  "version": "1.3.0",
+  "version": "1.2.0",
   "description": "Remote URL to Cloudflare R2 uploader with progress, MP4 faststart, and HLS (m3u8) output",
   "main": "server.js",
   "scripts": {
